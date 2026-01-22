@@ -99,20 +99,19 @@ def interact(port):
                 try:
                     data = conn.recv(4096)
                     if not data: break
-                    sys.stdout.write(data.decode(errors='ignore'))
+                    # Fix stair-stepping in raw mode: Replace \n with \r\n
+                    decoded = data.decode(errors='ignore')
+                    sys.stdout.write(decoded.replace('\n', '\r\n'))
                     sys.stdout.flush()
                 except:
                     break
             
             if sys.stdin in r:
                 chunk = sys.stdin.read(1)
-                if not chunk: break # EOF
-                # Check for detach sequence? Ctrl+C is usually \x03
-                # But in raw mode, \x03 is sent as is.
-                # We need a special key. Let's say we rely on Exception (Ctrl-C from user if not raw?)
-                # Actually raw mode catches Ctrl-C.
-                if chunk == '\x03': # Ctrl+C
+                # Check for Detach (Ctrl+C = \x03)
+                if chunk == '\x03':
                     break
+                
                 conn.send(chunk.encode())
                 
     except Exception as e:
