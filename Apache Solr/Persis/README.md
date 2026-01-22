@@ -54,7 +54,7 @@ chmod +x injector.sh
 Back on the listener, you will see ports changing status to `Connected`.
 
 **Commands:**
-- `interact <port>`: Switch to the shell on that port. (e.g., `interact 4002`)
+- `i <port>`: Switch to the shell on that port. (e.g., `i 4002`)
     - Inside the shell, press **Ctrl+C** to detach and return to the main menu.
 - `kill <port>`: Terminate the connection on that port.
 - `quit`: Exit the listener.
